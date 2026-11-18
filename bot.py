@@ -1,139 +1,86 @@
 import asyncio
-import logging
-import sqlite3
-import httpx
+import os
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiogram.filters import CommandStart, Command
+from google import genai
+from google.genai import types as genai_types
 
-BOT_TOKEN = "8692224611:AAE3_C-TmfYHynw-g3v09kV2yg28sZNGD_c"
+# Ключи подтянутся автоматически из настроек хостинга
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-GAMES = {
-    "Genshin Impact": "e202102251931481",
-    "Honkai: Star Rail": "e202303301540311",
-    "Zenless Zone Zero": "e202406031448091"
-}
-
-def init_db():
-    conn = sqlite3.connect("bot_data.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            ltuid TEXT NOT NULL,
-            ltoken TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-def save_user_tokens(user_id: int, ltuid: str, ltoken: str):
-    conn = sqlite3.connect("bot_data.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO users (user_id, ltuid, ltoken)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET ltuid=excluded.ltuid, ltoken=excluded.ltoken
-    """, (user_id, ltuid, ltoken))
-    conn.commit()
-    conn.close()
-
-def get_all_users():
-    conn = sqlite3.connect("bot_data.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, ltuid, ltoken FROM users")
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
-
-async def perform_checkin(ltuid: str, ltoken: str) -> str:
-    headers = {
-        "Cookie": f"ltuid_v2={ltuid}; ltoken_v2={ltoken};",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://act.hoyolab.com/",
-        "Origin": "https://act.hoyolab.com"
-    }
-
-    results = []
-    async with httpx.AsyncClient() as client:
-        for game_name, act_id in GAMES.items():
-            url = "https://sg-public-api.hoyolab.com/event/luna/os/sign"
-            payload = {"act_id": act_id}
-            try:
-                response = await client.post(url, json=payload, headers=headers)
-                data = response.json()
-                retcode = data.get("retcode")
-                msg = data.get("message", "")
-
-                if retcode == 0:
-                    results.append(f"✅ {game_name}: Успешно отмечено!")
-                elif retcode == -5003:
-                    results.append(f"ℹ️ {game_name}: Уже отмечено сегодня.")
-                else:
-                    results.append(f"❌ {game_name}: Ошибка ({retcode}) - {msg}")
-            except Exception as e:
-                results.append(f"⚠️ {game_name}: Ошибка сети ({e})")
-
-    return "\n".join(results)
-
-bot = Bot(token=BOT_TOKEN)
+client = genai.Client(api_key=GEMINI_API_KEY)
+bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-@dp.message(Command("start"))
+user_chats = {}
+
+# Характер бота (можешь поменять текст внутри кавычек на свой)
+SYSTEM_INSTRUCTION = (
+    "Ты дружелюбный, умный и полезный ИИ-ассистент в Telegram. "
+    "Отвечай понятно, по делу и помогай пользователю решать любые задачи."
+)
+
+def get_user_chat(user_id: int):
+    if user_id not in user_chats:
+        user_chats[user_id] = client.aio.chats.create(
+            model="gemini-3.8-flash",
+            config=genai_types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION,
+            )
+        )
+    return user_chats[user_id]
+
+@dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     await message.answer(
-        "Привет! Я бот для авто-отметок в HoYoLAB.\n\n"
-        "Отправь свои куки командой:\n"
-        "/setcookie <ltuid_v2> <ltoken_v2>\n\n"
-        "Проверить отметку: /checkin",
-        parse_mode="Markdown"
+        "Привет! Я твой личный ИИ-помощник на базе Gemini.\n"
+        "Задавай любой вопрос — я помню контекст нашей беседы.\n\n"
+        "Команда /clear очистит историю диалога."
     )
 
-@dp.message(Command("setcookie"))
-async def cmd_setcookie(message: types.Message):
-    args = message.text.split()[1:]
-    if len(args) != 2:
-        await message.answer("Ошибка! Формат: /setcookie <ltuid_v2> <ltoken_v2>", parse_mode="Markdown")
+@dp.message(Command("clear"))
+async def cmd_clear(message: types.Message):
+    user_chats.pop(message.from_user.id, None)
+    await message.answer("Память очищена! Начинаем с чистого листа.")
+
+@dp.message()
+async def handle_message(message: types.Message):
+    if not message.text:
+        await message.answer("Пока я понимаю только текстовые сообщения.")
         return
 
-    ltuid, ltoken = args[0], args[1]
-    save_user_tokens(message.from_user.id, ltuid, ltoken)
-    await message.answer("✅ Ваши токены сохранены! Бот будет автоматически отмечаться каждый день в 00:05.")
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
 
-@dp.message(Command("checkin"))
-async def cmd_checkin(message: types.Message):
-    conn = sqlite3.connect("bot_data.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT ltuid, ltoken FROM users WHERE user_id = ?", (message.from_user.id,))
-    row = cursor.fetchone()
-    conn.close()
+    try:
+        chat = get_user_chat(message.from_user.id)
+        response = await chat.send_message(message.text)
+        
+        text = response.text or "Не удалось сгенерировать ответ."
+        for i in range(0, len(text), 4096):
+            await message.answer(text[i:i + 4096])
+            
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
 
-    if not row:
-        await message.answer("Сначала сохраните куки через /setcookie <ltuid_v2> <ltoken_v2>.", parse_mode="Markdown")
-        return
+# Заглушка веб-сервера, чтобы бесплатный хостинг Render не выключал бота
+async def health_check(request):
+    return web.Response(text="Bot is running!")
 
-    await message.answer("⏳ Выполняю отметку...")
-    res = await perform_checkin(row[0], row[1])
-    await message.answer(res)
-
-async def daily_auto_checkin():
-    users = get_all_users()
-    for user_id, ltuid, ltoken in users:
-        res = await perform_checkin(ltuid, ltoken)
-        try:
-            await bot.send_message(user_id, f"📅 Ежедневная отметка:\n\n{res}", parse_mode="Markdown")
-        except Exception as e:
-            logging.error(f"Не удалось отправить сообщение {user_id}: {e}")
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
 
 async def main():
-    logging.basicConfig(level=logging.INFO)
-    init_db()
-
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(daily_auto_checkin, "cron", hour=0, minute=5)
-    scheduler.start()
-
+    await start_web_server()
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
-if name == "main":
+if __name__ == "__main__":
     asyncio.run(main())
